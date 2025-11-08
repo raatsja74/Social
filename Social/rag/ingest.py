@@ -14,11 +14,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
-import chromadb
 import yaml
-from bs4 import BeautifulSoup
-from markdown_it import MarkdownIt
-from sentence_transformers import SentenceTransformer
+
+try:  # Optional dependency used when persisting the vector store.
+    import chromadb  # type: ignore
+except ImportError:  # pragma: no cover - exercised implicitly in environments without chromadb
+    chromadb = None  # type: ignore
+
+try:  # Optional dependency used for generating embeddings.
+    from sentence_transformers import SentenceTransformer  # type: ignore
+except ImportError:  # pragma: no cover - exercised implicitly in environments without sentence-transformers
+    SentenceTransformer = None  # type: ignore
+
+try:  # Optional dependency for rich markdown rendering.
+    from bs4 import BeautifulSoup  # type: ignore
+except ImportError:  # pragma: no cover - exercised implicitly in environments without beautifulsoup4
+    BeautifulSoup = None  # type: ignore
+
+try:  # Optional dependency for markdown parsing.
+    from markdown_it import MarkdownIt  # type: ignore
+except ImportError:  # pragma: no cover - exercised implicitly in environments without markdown-it-py
+    MarkdownIt = None  # type: ignore
 
 
 @dataclass
@@ -59,6 +75,10 @@ def extract_front_matter(raw_text: str) -> tuple[Dict[str, str], str]:
 
 def markdown_to_text(markdown: str) -> str:
     """Convert markdown to clean plain text."""
+
+    if MarkdownIt is None or BeautifulSoup is None:
+        # Fall back to a plain text normalisation when optional dependencies are missing.
+        return re.sub(r"\s+", " ", markdown).strip()
 
     markdown_parser = MarkdownIt()
     html = markdown_parser.render(markdown)
@@ -128,19 +148,27 @@ def load_markdown_documents(paths: Iterable[Path]) -> List[Document]:
     return documents
 
 
-def collect_markdown_files(root: Path, source_dirs: Sequence[str], include_root: bool) -> List[Path]:
+def collect_markdown_files(
+    root: Path,
+    source_dirs: Sequence[str],
+    include_root: bool,
+    file_patterns: Sequence[str] | None = None,
+) -> List[Path]:
     """Gather markdown files from the configured folders."""
 
     markdown_files: List[Path] = []
+    patterns = list(file_patterns or ["*.md"])
 
     for directory in source_dirs:
         dir_path = (root / directory).resolve()
         if not dir_path.exists():
             continue
-        markdown_files.extend(sorted(dir_path.glob("**/*.md")))
+        for pattern in patterns:
+            markdown_files.extend(sorted(dir_path.glob(f"**/{pattern}")))
 
     if include_root:
-        markdown_files.extend(sorted(root.glob("*.md")))
+        for pattern in patterns:
+            markdown_files.extend(sorted(root.glob(pattern)))
 
     # Deduplicate while preserving order.
     seen = set()
@@ -168,6 +196,11 @@ def embed_chunks(chunks: Sequence[Chunk], model_name: str) -> List[List[float]]:
     if not chunks:
         return []
 
+    if SentenceTransformer is None:
+        raise RuntimeError(
+            "sentence-transformers is required to generate embeddings. Install it via 'pip install sentence-transformers'."
+        )
+
     model = SentenceTransformer(model_name)
     payload = [chunk.text for chunk in chunks]
     return model.encode(payload, show_progress_bar=True, convert_to_numpy=False).tolist()
@@ -181,6 +214,10 @@ def store_chunks(
     repository_root: Path,
 ) -> None:
     database_path.mkdir(parents=True, exist_ok=True)
+    if chromadb is None:
+        raise RuntimeError(
+            "chromadb is required to persist embeddings. Install it via 'pip install chromadb'."
+        )
     client = chromadb.PersistentClient(path=str(database_path))
     collection = client.get_or_create_collection(collection_name)
 
@@ -198,17 +235,29 @@ def store_chunks(
     collection.upsert(ids=ids, metadatas=metadatas, documents=documents, embeddings=embeddings)
 
 
+@dataclass
+class IngestionStats:
+    """Summary statistics for an ingestion run."""
+
+    document_count: int
+    chunk_count: int
+    source_files: List[Path]
+
+
 def run_ingestion(
     repository_root: Path,
     source_dirs: Sequence[str],
     include_root_files: bool,
+    file_patterns: Sequence[str] | None,
     chunk_size: int,
     chunk_overlap: int,
-    model_name: str,
-    collection_name: str,
-    database_path: Path,
-) -> None:
-    markdown_files = collect_markdown_files(repository_root, source_dirs, include_root_files)
+) -> tuple[IngestionStats, List[Chunk]]:
+    markdown_files = collect_markdown_files(
+        repository_root,
+        source_dirs,
+        include_root_files,
+        file_patterns=file_patterns,
+    )
     if not markdown_files:
         raise SystemExit("No markdown files found for ingestion.")
 
@@ -217,6 +266,21 @@ def run_ingestion(
     if not chunks:
         raise SystemExit("No chunks were produced from the provided documents.")
 
+    stats = IngestionStats(
+        document_count=len(documents),
+        chunk_count=len(chunks),
+        source_files=list(markdown_files),
+    )
+    return stats, chunks
+
+
+def persist_embeddings(
+    chunks: Sequence[Chunk],
+    model_name: str,
+    collection_name: str,
+    database_path: Path,
+    repository_root: Path,
+) -> None:
     embeddings = embed_chunks(chunks, model_name=model_name)
     store_chunks(
         chunks,
@@ -257,6 +321,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Skip markdown files located at the repository root.",
     )
     parser.set_defaults(include_root_files=True)
+    parser.add_argument(
+        "--file-patterns",
+        nargs="*",
+        default=["*.md"],
+        help="Glob patterns that determine which files will be ingested.",
+    )
     parser.add_argument("--chunk-size", type=int, default=900, help="Target chunk size in characters.")
     parser.add_argument("--chunk-overlap", type=int, default=150, help="Overlap between consecutive chunks in characters.")
     parser.add_argument(
@@ -274,6 +344,11 @@ def parse_arguments() -> argparse.Namespace:
         default="data/vector_store",
         help="Directory where the Chroma database will be stored.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Analyse the markdown corpus without generating embeddings or writing to the database.",
+    )
     return parser.parse_args()
 
 
@@ -282,16 +357,27 @@ def main() -> None:
     repository_root = Path(__file__).resolve().parent.parent
     database_path = repository_root / args.database_path
 
-    run_ingestion(
+    stats, chunks = run_ingestion(
         repository_root=repository_root,
         source_dirs=args.source_dirs,
         include_root_files=args.include_root_files,
+        file_patterns=args.file_patterns,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
-        model_name=args.model_name,
-        collection_name=args.collection_name,
-        database_path=database_path,
     )
+
+    if args.dry_run:
+        print("Dry run complete. No embeddings were generated.")
+    else:
+        persist_embeddings(
+            chunks,
+            model_name=args.model_name,
+            collection_name=args.collection_name,
+            database_path=database_path,
+            repository_root=repository_root,
+        )
+
+    print(f"Processed {stats.document_count} documents into {stats.chunk_count} chunks.")
 
 
 if __name__ == "__main__":
